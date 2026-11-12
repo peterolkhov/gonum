@@ -1,0 +1,43 @@
+name: Gonum exact native format diagnostics
+on:
+  push:
+    branches: [codex/diagnose-wasserstein-format]
+permissions:
+  contents: read
+jobs:
+  format:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: peterolkhov/gonum
+          ref: 35aff0dbcfe82ce58dbbabfa63b74205f4c77603
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version: '1.26.x'
+          cache: false
+      - name: Print actual candidate and baseline formatting differences
+        run: |
+          test "$(git rev-parse HEAD)" = 35aff0dbcfe82ce58dbbabfa63b74205f4c77603
+          python3 - <<'FORMAT_RESULT'
+          import json,pathlib,subprocess
+          paths=['stat/stat.go','stat/wasserstein_preserve_test.go']
+          saved={p:pathlib.Path(p).read_bytes()for p in paths}
+          def format_diff(paths):
+              r=subprocess.run(['go','tool','golang.org/x/tools/cmd/goimports','-d',*paths],text=True,capture_output=True)
+              assert r.returncode==0,r.stderr
+              return r.stdout
+          candidate_touched=format_diff(paths)
+          candidate_all=format_diff(['.'])
+          try:
+              pathlib.Path(paths[0]).write_bytes(subprocess.check_output(['git','show','bda3a37c92f9e957b722e54d48976dbac393bec4:'+paths[0]]))
+              pathlib.Path(paths[1]).unlink()
+              baseline_all=format_diff(['.'])
+          finally:
+              for p,data in saved.items():pathlib.Path(p).write_bytes(data)
+          assert subprocess.check_output(['git','diff','--name-only'],text=True)==''
+          print('GOIMPORTS_BASELINE_COMPARISON='+json.dumps({'candidate':'35aff0dbcfe82ce58dbbabfa63b74205f4c77603','go':subprocess.check_output(['go','version'],text=True).strip(),'candidate_touched_diff':candidate_touched,'candidate_full_diff':candidate_all,'baseline_full_diff':baseline_all}))
+          FORMAT_RESULT
