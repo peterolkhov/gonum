@@ -1,0 +1,209 @@
+name: Gonum Wasserstein preservation validation
+on:
+  push:
+    branches: [codex/validate-wasserstein-preservation]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: peterolkhov/gonum
+          fetch-depth: 2
+          ref: 35aff0dbcfe82ce58dbbabfa63b74205f4c77603
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version: '1.26.x'
+          cache: false
+      - name: Bound candidate, full-module callers, and native RED
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 35aff0dbcfe82ce58dbbabfa63b74205f4c77603
+          git merge-base --is-ancestor bda3a37c92f9e957b722e54d48976dbac393bec4 HEAD
+          test "$(git diff --name-only bda3a37c92f9e957b722e54d48976dbac393bec4 HEAD)" = "$(printf 'stat/stat.go\nstat/wasserstein_preserve_test.go')"
+          echo 'b6b7b517a6dc45f276de22eced459c95d850a598a068a0de75ad2132efcd5c98  stat/stat.go' | sha256sum -c
+          echo '843576cd01f1162fea92b9e8884bb3b12690591298a3263551a9135afb9a19dc  stat/wasserstein_preserve_test.go' | sha256sum -c
+          go version
+          git grep -n -E 'normalizeWeights\(|WassersteinDistance(ND)?\(' -- '*.go'
+          cp stat/stat.go /tmp/wasserstein-candidate-stat.go
+          git show bda3a37c92f9e957b722e54d48976dbac393bec4:stat/stat.go > stat/stat.go
+          echo '0888d0d7b3cb79eae65d6ceea67fd98db252acb19cdae782d5ea07563e1eb5ba  stat/stat.go' | sha256sum -c
+          set +e
+          go test ./stat -run '^TestWassersteinDistancePreserves' -count=1 -json > /tmp/native-red.json
+          product_status=$?
+          set -e
+          cat /tmp/native-red.json
+          test "$product_status" -eq 1
+          python3 - <<'PY'
+          import json, pathlib
+          events=[json.loads(line) for line in pathlib.Path('/tmp/native-red.json').read_text().splitlines()]
+          failures={e['Test'] for e in events if e.get('Test') and e['Action']=='fail'}
+          for api in ['1D','ND']:
+              for case in ['count_weights','overlapping_weights','points_and_weights_share_storage']:
+                  assert f'TestWassersteinDistancePreservesInputs/{api}/{case}' in failures, failures
+              assert f'TestWassersteinDistancePreservesWeightsOnPanic/{api}' in failures, failures
+              for case in ['single_points','identical_distributions']:
+                  assert any(e.get('Test')==f'TestWassersteinDistancePreservesInputs/{api}/{case}' and e['Action']=='pass' for e in events)
+          print('NATIVE_RED_CONFIRMED='+json.dumps(sorted(failures)))
+          PY
+          cp /tmp/wasserstein-candidate-stat.go stat/stat.go
+          echo 'b6b7b517a6dc45f276de22eced459c95d850a598a068a0de75ad2132efcd5c98  stat/stat.go' | sha256sum -c
+      - name: Native GREEN and complete affected package
+        run: |
+          set -e
+          go test ./stat -run '^TestWassersteinDistancePreserves' -count=1 -v
+          go test ./stat -count=1
+          test -z "$(git diff -- stat/stat.go stat/wasserstein_preserve_test.go)"
+      - name: Unchanged public fixture after the fix
+        run: |
+          set -e
+          test ! -e stat/wasserstein_preservation_test.go
+          python3 - <<'PYFIXTURE'
+          import base64, hashlib, pathlib
+          data=base64.b64decode('cGFja2FnZSBzdGF0X3Rlc3QKCmltcG9ydCAoCiAgICAibWF0aCIKICAgICJzbGljZXMiCiAgICAidGVzdGluZyIKCiAgICAiZ29udW0ub3JnL3YxL2dvbnVtL21hdCIKICAgICJnb251bS5vcmcvdjEvZ29udW0vc3RhdCIKKQoKZnVuYyBUZXN0V2Fzc2Vyc3RlaW5Db3VudFdlaWdodHNQcmVzZXJ2ZWQodCAqdGVzdGluZy5UKSB7CiAgICBmb3IgXywgbmQgOj0gcmFuZ2UgW11ib29se2ZhbHNlLCB0cnVlfSB7CiAgICAgICAgbmFtZSA6PSAiMUQiCiAgICAgICAgaWYgbmQgeyBuYW1lID0gIk5EIiB9CiAgICAgICAgdC5SdW4obmFtZSwgZnVuYyh0ICp0ZXN0aW5nLlQpIHsKICAgICAgICAgICAgcCwgcSA6PSBbXWZsb2F0NjR7MCwgMTB9LCBbXWZsb2F0NjR7MCwgMjB9CiAgICAgICAgICAgIHB3LCBxdyA6PSBbXWZsb2F0NjR7MiwgMn0sIFtdZmxvYXQ2NHszLCAzfQogICAgICAgICAgICBvcmlnaW5hbFBXLCBvcmlnaW5hbFFXIDo9IHNsaWNlcy5DbG9uZShwdyksIHNsaWNlcy5DbG9uZShxdykKICAgICAgICAgICAgdmFyaWFuY2VCZWZvcmUgOj0gc3RhdC5WYXJpYW5jZShwLCBwdykKICAgICAgICAgICAgdmFyIGRpc3RhbmNlIGZsb2F0NjQKICAgICAgICAgICAgaWYgbmQgewogICAgICAgICAgICAgICAgdmFyIGVyciBlcnJvcgogICAgICAgICAgICAgICAgZGlzdGFuY2UsIGVyciA9IHN0YXQuV2Fzc2Vyc3RlaW5EaXN0YW5jZU5EKG1hdC5OZXdEZW5zZSgyLCAxLCBwKSwgbWF0Lk5ld0RlbnNlKDIsIDEsIHEpLCBwdywgcXcsIDFlLTEyKQogICAgICAgICAgICAgICAgaWYgZXJyICE9IG5pbCB7IHQuRmF0YWwoZXJyKSB9CiAgICAgICAgICAgIH0gZWxzZSB7CiAgICAgICAgICAgICAgICBkaXN0YW5jZSA9IHN0YXQuV2Fzc2Vyc3RlaW5EaXN0YW5jZShwLCBxLCBwdywgcXcpCiAgICAgICAgICAgIH0KICAgICAgICAgICAgaWYgbWF0aC5BYnMoZGlzdGFuY2UtNSkgPiAxZS0xMCB7IHQuRXJyb3JmKCJkaXN0YW5jZT0lZywgd2FudCA1IiwgZGlzdGFuY2UpIH0KICAgICAgICAgICAgaWYgIXNsaWNlcy5FcXVhbChwdywgb3JpZ2luYWxQVykgfHwgIXNsaWNlcy5FcXVhbChxdywgb3JpZ2luYWxRVykgewogICAgICAgICAgICAgICAgdC5FcnJvcmYoImNhbGxlciBjb3VudCB3ZWlnaHRzIGNoYW5nZWQ6IHA9JXYgcT0ldiwgd2FudCAldiAldiIsIHB3LCBxdywgb3JpZ2luYWxQVywgb3JpZ2luYWxRVykKICAgICAgICAgICAgfQogICAgICAgICAgICB2YXJpYW5jZUFmdGVyIDo9IHN0YXQuVmFyaWFuY2UocCwgcHcpCiAgICAgICAgICAgIGlmIG1hdGguQWJzKHZhcmlhbmNlQmVmb3JlLTEwMC4wLzMpID4gMWUtMTAgeyB0LkZhdGFsZigiaW52YWxpZCBjb250cm9sIHZhcmlhbmNlPSVnIiwgdmFyaWFuY2VCZWZvcmUpIH0KICAgICAgICAgICAgaWYgbWF0aC5Jc0luZih2YXJpYW5jZUFmdGVyLCAwKSB8fCBtYXRoLklzTmFOKHZhcmlhbmNlQWZ0ZXIpIHx8IG1hdGguQWJzKHZhcmlhbmNlQWZ0ZXItdmFyaWFuY2VCZWZvcmUpID4gMWUtMTAgewogICAgICAgICAgICAgICAgdC5FcnJvcmYoInJldXNlZCBjb3VudCB3ZWlnaHRzOiB2YXJpYW5jZSBiZWZvcmU9JWcgYWZ0ZXI9JWc7IHdhbnQgdW5jaGFuZ2VkIiwgdmFyaWFuY2VCZWZvcmUsIHZhcmlhbmNlQWZ0ZXIpCiAgICAgICAgICAgIH0KICAgICAgICB9KQogICAgfQp9CgpmdW5jIFRlc3RXYXNzZXJzdGVpbk92ZXJsYXBwaW5nV2VpZ2h0Vmlld3ModCAqdGVzdGluZy5UKSB7CiAgICBwLCBxIDo9IFtdZmxvYXQ2NHswLCAxMH0sIFtdZmxvYXQ2NHswLCAyMH0KICAgIGJhY2tpbmcgOj0gW11mbG9hdDY0ezEsIDEsIDF9CiAgICBnb3QgOj0gc3RhdC5XYXNzZXJzdGVpbkRpc3RhbmNlKHAsIHEsIGJhY2tpbmdbOjJdLCBiYWNraW5nWzE6XSkKICAgIGlmIG1hdGguQWJzKGdvdC01KSA+IDFlLTEwIHsgdC5FcnJvcmYoIm92ZXJsYXBwaW5nIHdlaWdodCB2aWV3cyBkaXN0YW5jZT0lZywgd2FudCA1IiwgZ290KSB9CiAgICBpZiAhc2xpY2VzLkVxdWFsKGJhY2tpbmcsIFtdZmxvYXQ2NHsxLCAxLCAxfSkgeyB0LkVycm9yZigiYmFja2luZz0ldiwgd2FudCBbMSAxIDFdIiwgYmFja2luZykgfQp9CgpmdW5jIFRlc3RXYXNzZXJzdGVpblVuY2hhbmdlZENvbnRyb2xzKHQgKnRlc3RpbmcuVCkgewogICAgcCwgcSA6PSBbXWZsb2F0NjR7MCwgMTB9LCBbXWZsb2F0NjR7MCwgMjB9CiAgICBmb3IgXywgdGMgOj0gcmFuZ2UgW11zdHJ1Y3QgeyBuYW1lIHN0cmluZzsgcHcsIHF3IFtdZmxvYXQ2NDsgd2FudCBmbG9hdDY0IH17CiAgICAgICAgeyJuaWwgdW5pZm9ybSIsIG5pbCwgbmlsLCA1fSwKICAgICAgICB7ImFscmVhZHkgbm9ybWFsaXplZCIsIFtdZmxvYXQ2NHswLjUsMC41fSwgW11mbG9hdDY0ezAuNSwwLjV9LCA1fSwKICAgICAgICB7ImluZGVwZW5kZW50IGNvdW50IHdlaWdodHMiLCBbXWZsb2F0NjR7MSwxfSwgW11mbG9hdDY0ezEsMX0sIDV9LAogICAgICAgIHsibm9udW5pZm9ybSB3ZWlnaHRzIiwgW11mbG9hdDY0ezMsMX0sIFtdZmxvYXQ2NHsyLDJ9LCA3LjV9LAogICAgfSB7CiAgICAgICAgdC5SdW4odGMubmFtZSwgZnVuYyh0ICp0ZXN0aW5nLlQpIHsKICAgICAgICAgICAgZ290IDo9IHN0YXQuV2Fzc2Vyc3RlaW5EaXN0YW5jZShwLHEsdGMucHcsdGMucXcpCiAgICAgICAgICAgIGlmIG1hdGguQWJzKGdvdC10Yy53YW50KSA+IDFlLTEwIHsgdC5FcnJvcmYoImRpc3RhbmNlPSVnLCB3YW50ICVnIixnb3QsdGMud2FudCkgfQogICAgICAgIH0pCiAgICB9CiAgICBpZiBnb3QgOj0gc3RhdC5XYXNzZXJzdGVpbkRpc3RhbmNlKFtdZmxvYXQ2NHsxfSwgW11mbG9hdDY0ezR9LCBbXWZsb2F0NjR7Mn0sIFtdZmxvYXQ2NHszfSk7IGdvdCAhPSAzIHsgdC5FcnJvcmYoInNpbmdsZSBwb2ludHM9JWcsIHdhbnQgMyIsZ290KSB9CiAgICBpZiBnb3QgOj0gc3RhdC5XYXNzZXJzdGVpbkRpc3RhbmNlKHAsIHAsIFtdZmxvYXQ2NHsyLDJ9LCBbXWZsb2F0NjR7MiwyfSk7IGdvdCAhPSAwIHsgdC5FcnJvcmYoImlkZW50aWNhbD0lZywgd2FudCAwIixnb3QpIH0KfQo=')
+          assert hashlib.sha256(data).hexdigest()=='27b24298cd43c7d386ec69ec5f1a7096cd08d9001659620aeb5330de25ba22b0'
+          pathlib.Path('stat/wasserstein_preservation_test.go').write_bytes(data)
+          PYFIXTURE
+          go test ./stat -run 'TestWasserstein(CountWeightsPreserved|OverlappingWeightViews|UnchangedControls)$' -count=1 -v
+          rm stat/wasserstein_preservation_test.go
+          test -z "$(git diff -- stat/stat.go stat/wasserstein_preserve_test.go)"
+  native:
+    needs: regression
+    strategy:
+      fail-fast: false
+      matrix:
+        go-version: [1.27.x, 1.26.x]
+        platform: [ubuntu-latest, macos-latest]
+        force-goarch: ["", "386"]
+        tags: ["", "-tags bounds", "-tags noasm", "-tags safe"]
+        exclude:
+          - {platform: ubuntu-latest, tags: "-tags bounds", force-goarch: "386"}
+          - {platform: ubuntu-latest, tags: "-tags noasm", force-goarch: "386"}
+          - {platform: ubuntu-latest, tags: "-tags safe", force-goarch: "386"}
+          - {platform: macos-latest, force-goarch: "386"}
+          - {platform: macos-latest, tags: "-tags bounds"}
+          - {platform: macos-latest, tags: "-tags noasm"}
+          - {platform: macos-latest, tags: "-tags safe"}
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 90
+    env:
+      GO111MODULE: on
+      GOPATH: ${{ github.workspace }}
+      TAGS: ${{ matrix.tags }}
+      FORCE_GOARCH: ${{ matrix.force-goarch }}
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}/src/gonum.org/v1/gonum
+    steps:
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: peterolkhov/gonum
+          fetch-depth: 2
+          ref: 35aff0dbcfe82ce58dbbabfa63b74205f4c77603
+          persist-credentials: false
+          path: src/gonum.org/v1/gonum
+      - name: Verify candidate bindings
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 35aff0dbcfe82ce58dbbabfa63b74205f4c77603
+          test "$(git diff --name-only bda3a37c92f9e957b722e54d48976dbac393bec4 HEAD)" = "$(printf 'stat/stat.go\nstat/wasserstein_preserve_test.go')"
+          python3 - <<'PY'
+          import hashlib, pathlib
+          for path,want in [('stat/stat.go','b6b7b517a6dc45f276de22eced459c95d850a598a068a0de75ad2132efcd5c98'),('stat/wasserstein_preserve_test.go','843576cd01f1162fea92b9e8884bb3b12690591298a3263551a9135afb9a19dc')]:
+              assert hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()==want,path
+          PY
+          go version
+      - name: Native copyright, imports, formatting, generation gates
+        if: matrix.platform == 'ubuntu-latest' && matrix.tags == ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -qq ragel
+          bash -e ./.github/workflows/script.d/check-copyright.sh
+          bash -e ./.github/workflows/script.d/check-imports.sh
+          test -z "$(go tool golang.org/x/tools/cmd/goimports -d stat/stat.go stat/wasserstein_preserve_test.go)"
+          test -z "$(gofmt -s -l stat/stat.go stat/wasserstein_preserve_test.go)"
+          bash -e ./.github/workflows/script.d/check-formatting.sh
+          bash -e ./.github/workflows/script.d/check-generate.sh
+      - name: Native complete module build and tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The native script's commands are retained and each failure is fatal.
+          if [[ -n "$FORCE_GOARCH" ]]; then export GOARCH="$FORCE_GOARCH"; fi
+          go get -d -v ./...
+          go build -v ./...
+          go test $TAGS -v ./...
+          test -z "$(git diff)"
+      - name: Native coverage
+        if: matrix.platform == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYCOVERAGE'
+          import os, pathlib, shlex, subprocess, tempfile
+          root=pathlib.Path.cwd()
+          excluded=('testlapack','testblas','testgraph','testrand')
+          directories=sorted(pathlib.Path(d) for d,_,files in os.walk('.') if not any(part in d for part in excluded) and any(f.endswith('.go') for f in files))
+          with tempfile.TemporaryDirectory() as temp:
+              profile=pathlib.Path(temp)/'profile.out'
+              combined=pathlib.Path(temp)/'coverage.txt'
+              with combined.open('w') as output:
+                  output.write('mode: set\n')
+                  for directory in directories:
+                      profile.unlink(missing_ok=True)
+                      subprocess.run(['go','test',*shlex.split(os.environ['TAGS']),'-coverprofile='+str(profile),'-covermode=set'],cwd=root/directory,check=True)
+                      if profile.exists():
+                          output.writelines(line for line in profile.read_text().splitlines(True) if not line.startswith('mode: set'))
+              print('GONUM_COVERAGE_PACKAGES='+str(len(directories)),flush=True)
+          PYCOVERAGE
+          test -z "$(git diff)"
+      - name: Verify final candidate identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 35aff0dbcfe82ce58dbbabfa63b74205f4c77603
+          test "$(git diff --name-only bda3a37c92f9e957b722e54d48976dbac393bec4 HEAD)" = "$(printf 'stat/stat.go\nstat/wasserstein_preserve_test.go')"
+          python3 - <<'PYFINAL'
+          import hashlib, pathlib
+          for path,want in [('stat/stat.go','b6b7b517a6dc45f276de22eced459c95d850a598a068a0de75ad2132efcd5c98'),('stat/wasserstein_preserve_test.go','843576cd01f1162fea92b9e8884bb3b12690591298a3263551a9135afb9a19dc')]:
+              assert hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()==want,path
+          PYFINAL
+          test -z "$(git diff)"
+  staticcheck:
+    needs: regression
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: peterolkhov/gonum
+          fetch-depth: 2
+          ref: 35aff0dbcfe82ce58dbbabfa63b74205f4c77603
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version: '1.26.x'
+          cache: false
+      - name: Official-version staticcheck
+        run: |
+          set -e
+          test "$(git rev-parse HEAD)" = 35aff0dbcfe82ce58dbbabfa63b74205f4c77603
+          test "$(git diff --name-only bda3a37c92f9e957b722e54d48976dbac393bec4 HEAD)" = "$(printf 'stat/stat.go\nstat/wasserstein_preserve_test.go')"
+          go run honnef.co/go/tools/cmd/staticcheck@2025.1 ./...
+          test "$(git rev-parse HEAD)" = 35aff0dbcfe82ce58dbbabfa63b74205f4c77603
+          echo 'b6b7b517a6dc45f276de22eced459c95d850a598a068a0de75ad2132efcd5c98  stat/stat.go' | sha256sum -c
+          echo '843576cd01f1162fea92b9e8884bb3b12690591298a3263551a9135afb9a19dc  stat/wasserstein_preserve_test.go' | sha256sum -c
+          test -z "$(git diff)"
