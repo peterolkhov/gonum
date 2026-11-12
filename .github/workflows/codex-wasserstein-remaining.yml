@@ -1,0 +1,220 @@
+name: Gonum Wasserstein remaining native validation
+on:
+  push:
+    branches: [codex/validate-wasserstein-remaining]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  remaining-build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        go-version: [1.27.x, 1.26.x]
+        goarch: [amd64, '386']
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GO111MODULE: on
+      GOPATH: ${{ github.workspace }}
+      GOARCH: ${{ matrix.goarch }}
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}/src/gonum.org/v1/gonum
+    steps:
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: peterolkhov/gonum
+          ref: 35aff0dbcfe82ce58dbbabfa63b74205f4c77603
+          fetch-depth: 2
+          persist-credentials: false
+          path: src/gonum.org/v1/gonum
+      - name: Exact candidate and complete native build and tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 35aff0dbcfe82ce58dbbabfa63b74205f4c77603
+          test "$(git diff --name-only bda3a37c92f9e957b722e54d48976dbac393bec4 HEAD)" = "$(printf 'stat/stat.go\nstat/wasserstein_preserve_test.go')"
+          echo 'b6b7b517a6dc45f276de22eced459c95d850a598a068a0de75ad2132efcd5c98  stat/stat.go' | sha256sum -c
+          echo '843576cd01f1162fea92b9e8884bb3b12690591298a3263551a9135afb9a19dc  stat/wasserstein_preserve_test.go' | sha256sum -c
+          go version
+          test "$(go env GOARCH)" = "$GOARCH"
+          go get -d -v ./...
+          go build -v ./...
+          go test -v ./...
+          test "$(git rev-parse HEAD)" = 35aff0dbcfe82ce58dbbabfa63b74205f4c77603
+          echo 'b6b7b517a6dc45f276de22eced459c95d850a598a068a0de75ad2132efcd5c98  stat/stat.go' | sha256sum -c
+          echo '843576cd01f1162fea92b9e8884bb3b12690591298a3263551a9135afb9a19dc  stat/wasserstein_preserve_test.go' | sha256sum -c
+          test -z "$(git diff)"
+  generation-comparison:
+    strategy:
+      fail-fast: false
+      matrix:
+        go-version: [1.27.x, 1.26.x]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GO111MODULE: on
+      GOPATH: ${{ github.workspace }}
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}/src/gonum.org/v1/gonum
+    steps:
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: peterolkhov/gonum
+          ref: 35aff0dbcfe82ce58dbbabfa63b74205f4c77603
+          fetch-depth: 2
+          persist-credentials: false
+          path: src/gonum.org/v1/gonum
+      - name: Standalone native generation and actual original HEAD comparison
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -qq ragel
+          python3 - <<'PYGEN'
+          import hashlib, json, pathlib, subprocess, re
+          candidate='35aff0dbcfe82ce58dbbabfa63b74205f4c77603'
+          base='bda3a37c92f9e957b722e54d48976dbac393bec4'
+          def git(*args):
+              return subprocess.check_output(['git',*args],text=True).strip()
+          assert git('rev-parse','HEAD')==candidate
+          assert git('diff','--name-only',base,'HEAD').splitlines()==['stat/stat.go','stat/wasserstein_preserve_test.go']
+          results={}
+          try:
+              for label,commit in [('candidate',candidate),('base',base)]:
+                  subprocess.run(['git','reset','--hard'],check=True)
+                  subprocess.run(['git','clean','-fd'],check=True)
+                  subprocess.run(['git','checkout','--detach',commit],check=True)
+                  assert git('rev-parse','HEAD')==commit
+                  assert not git('status','--porcelain')
+                  formatted=subprocess.run(['go','tool','golang.org/x/tools/cmd/goimports','-d','.'],text=True,capture_output=True,check=True).stdout
+                  normalized=re.sub(r'(?m)^((?:---|\+\+\+) [^\t\n]+)\t[^\n]*',r'\1',formatted)
+                  if label=='candidate':
+                      touched=subprocess.run(['go','tool','golang.org/x/tools/cmd/goimports','-d','stat/stat.go','stat/wasserstein_preserve_test.go'],text=True,capture_output=True,check=True).stdout
+                      assert not touched,touched
+                  print('GONUM_FORMAT_BASELINE_CHECK='+json.dumps({'label':label,'go':subprocess.check_output(['go','version'],text=True).strip(),'normalized_diff_sha256':hashlib.sha256(normalized.encode()).hexdigest(),'files':re.findall(r'^diff -u (\S+)\.orig ',formatted,re.M)}),flush=True)
+                  result=subprocess.run(['bash','-e','./.github/workflows/script.d/check-generate.sh'],text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+                  diff=git('diff','--no-ext-diff','--no-color')
+                  results[label]={'head':git('rev-parse','HEAD'),'returncode':result.returncode,'diff':diff,'log':result.stdout,'normalized_format_diff_sha256':hashlib.sha256(normalized.encode()).hexdigest()}
+          finally:
+              subprocess.run(['git','reset','--hard'],check=True)
+              subprocess.run(['git','clean','-fd'],check=True)
+              subprocess.run(['git','checkout','--detach',candidate],check=True)
+              assert git('rev-parse','HEAD')==candidate
+              assert not git('status','--porcelain')
+              for path,want in [('stat/stat.go','b6b7b517a6dc45f276de22eced459c95d850a598a068a0de75ad2132efcd5c98'),('stat/wasserstein_preserve_test.go','843576cd01f1162fea92b9e8884bb3b12690591298a3263551a9135afb9a19dc')]:
+                  assert hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()==want,path
+          print('GONUM_GENERATION_COMPARISON='+json.dumps({'go':subprocess.check_output(['go','version'],text=True).strip(),'results':results,'final_head':git('rev-parse','HEAD')}),flush=True)
+          assert results['candidate']['normalized_format_diff_sha256']==results['base']['normalized_format_diff_sha256']
+          assert results['candidate']['returncode']==results['base']['returncode']
+          assert results['candidate']['diff']==results['base']['diff']
+          # A failed generator without an identical tracked diff needs independent triage.
+          assert results['candidate']['returncode']==0 or results['candidate']['diff']
+          PYGEN
+  original-coverage-scan-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version: '1.26.x'
+          cache: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: peterolkhov/gonum
+          ref: bda3a37c92f9e957b722e54d48976dbac393bec4
+          persist-credentials: false
+      - name: Actual original HEAD exposes native directory scan limitation
+        run: |
+          set -e
+          test "$(git rev-parse HEAD)" = bda3a37c92f9e957b722e54d48976dbac393bec4
+          test -z "$(git status --porcelain)"
+          python3 - <<'PYBASECOVER'
+          import json, pathlib, subprocess, tempfile
+          with tempfile.TemporaryDirectory() as temp:
+              result=subprocess.run(['go','test','-coverprofile='+str(pathlib.Path(temp)/'profile.out'),'-covermode=set'],cwd='graph/community/testdata',text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+          print('GONUM_ORIGINAL_COVERAGE_SCAN_LIMIT='+json.dumps({'head':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),'go':subprocess.check_output(['go','version'],text=True).strip(),'returncode':result.returncode,'output':result.stdout}),flush=True)
+          assert result.returncode==1
+          assert 'build constraints exclude all Go files' in result.stdout
+          assert not subprocess.check_output(['git','status','--porcelain'],text=True).strip()
+          PYBASECOVER
+  buildable-package-coverage:
+    strategy:
+      fail-fast: false
+      matrix:
+        go-version: [1.27.x, 1.26.x]
+        goarch: [amd64, '386']
+        tags: ['', bounds, noasm, safe]
+        exclude:
+          - {goarch: '386', tags: bounds}
+          - {goarch: '386', tags: noasm}
+          - {goarch: '386', tags: safe}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GO111MODULE: on
+      GOPATH: ${{ github.workspace }}
+      GOARCH: ${{ matrix.goarch }}
+      GONUM_TAGS: ${{ matrix.tags }}
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}/src/gonum.org/v1/gonum
+    steps:
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: peterolkhov/gonum
+          ref: 35aff0dbcfe82ce58dbbabfa63b74205f4c77603
+          fetch-depth: 2
+          persist-credentials: false
+          path: src/gonum.org/v1/gonum
+      - name: Strict coverage of buildable module packages with native exclusions
+        run: |
+          set -e
+          python3 - <<'PYCOVERAGE'
+          import hashlib, json, os, pathlib, subprocess, tempfile
+          candidate='35aff0dbcfe82ce58dbbabfa63b74205f4c77603'
+          def git(*args):
+              return subprocess.check_output(['git',*args],text=True).strip()
+          def bind():
+              assert git('rev-parse','HEAD')==candidate
+              assert git('diff','--name-only','bda3a37c92f9e957b722e54d48976dbac393bec4','HEAD').splitlines()==['stat/stat.go','stat/wasserstein_preserve_test.go']
+              for path,want in [('stat/stat.go','b6b7b517a6dc45f276de22eced459c95d850a598a068a0de75ad2132efcd5c98'),('stat/wasserstein_preserve_test.go','843576cd01f1162fea92b9e8884bb3b12690591298a3263551a9135afb9a19dc')]:
+                  assert hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()==want,path
+              assert not git('diff')
+          bind()
+          arch=subprocess.check_output(['go','env','GOARCH'],text=True).strip()
+          assert arch==os.environ['GOARCH']
+          tags=['-tags',os.environ['GONUM_TAGS']] if os.environ['GONUM_TAGS'] else []
+          packages=subprocess.check_output(['go','list',*tags,'./...'],text=True).splitlines()
+          excluded=('testlapack','testblas','testgraph','testrand')
+          selected=[package for package in packages if not any(part in package for part in excluded)]
+          assert 'gonum.org/v1/gonum/stat' in selected
+          assert 'gonum.org/v1/gonum/graph/community/testdata' not in packages
+          print('GONUM_BUILDABLE_COVERAGE_SELECTION='+json.dumps({'head':git('rev-parse','HEAD'),'go':subprocess.check_output(['go','version'],text=True).strip(),'goarch':arch,'tags':os.environ['GONUM_TAGS'],'excluded_path_substrings':excluded,'packages':selected,'native_directory_scan_limit':'build-ignored fixture directories are not packages selected by go list'}),flush=True)
+          with tempfile.TemporaryDirectory() as temp:
+              profile=pathlib.Path(temp)/'profile.out'
+              combined=pathlib.Path(temp)/'coverage.txt'
+              with combined.open('w') as output:
+                  output.write('mode: set\n')
+                  for package in selected:
+                      profile.unlink(missing_ok=True)
+                      subprocess.run(['go','test',*tags,'-coverprofile='+str(profile),'-covermode=set',package],check=True)
+                      if profile.exists():
+                          output.writelines(line for line in profile.read_text().splitlines(True) if not line.startswith('mode: set'))
+              print('GONUM_BUILDABLE_COVERAGE_COMPLETE='+json.dumps({'head':git('rev-parse','HEAD'),'goarch':arch,'tags':os.environ['GONUM_TAGS'],'package_count':len(selected),'combined_profile_bytes':combined.stat().st_size}),flush=True)
+          bind()
+          PYCOVERAGE
