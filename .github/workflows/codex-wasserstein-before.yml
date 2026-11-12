@@ -1,0 +1,112 @@
+name: Gonum public Wasserstein before proof
+on:
+  push:
+    branches: [codex/diagnose-wasserstein-weights]
+permissions:
+  contents: read
+jobs:
+  before:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: gonum/gonum
+          ref: bda3a37c92f9e957b722e54d48976dbac393bec4
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version: '1.26.x'
+          cache: false
+      - name: Exact unchanged module and existing Wasserstein tests
+        run: |
+          test "$(git rev-parse HEAD)" = bda3a37c92f9e957b722e54d48976dbac393bec4
+          test -z "$(git status --porcelain)"
+          go version
+          go test ./stat -run 'Test(WassersteinDistance|WassersteinDistanceND|NormalizeWeights)$' -count=1 -v
+      - name: Public API owned-data regression fixture
+        run: |
+          test ! -e stat/wasserstein_preservation_test.go
+          cat > stat/wasserstein_preservation_test.go <<'GONUM_FIXTURE'
+          package stat_test
+
+          import (
+              "math"
+              "slices"
+              "testing"
+
+              "gonum.org/v1/gonum/mat"
+              "gonum.org/v1/gonum/stat"
+          )
+
+          func TestWassersteinCountWeightsPreserved(t *testing.T) {
+              for _, nd := range []bool{false, true} {
+                  name := "1D"
+                  if nd { name = "ND" }
+                  t.Run(name, func(t *testing.T) {
+                      p, q := []float64{0, 10}, []float64{0, 20}
+                      pw, qw := []float64{2, 2}, []float64{3, 3}
+                      originalPW, originalQW := slices.Clone(pw), slices.Clone(qw)
+                      varianceBefore := stat.Variance(p, pw)
+                      var distance float64
+                      if nd {
+                          var err error
+                          distance, err = stat.WassersteinDistanceND(mat.NewDense(2, 1, p), mat.NewDense(2, 1, q), pw, qw, 1e-12)
+                          if err != nil { t.Fatal(err) }
+                      } else {
+                          distance = stat.WassersteinDistance(p, q, pw, qw)
+                      }
+                      if math.Abs(distance-5) > 1e-10 { t.Errorf("distance=%g, want 5", distance) }
+                      if !slices.Equal(pw, originalPW) || !slices.Equal(qw, originalQW) {
+                          t.Errorf("caller count weights changed: p=%v q=%v, want %v %v", pw, qw, originalPW, originalQW)
+                      }
+                      varianceAfter := stat.Variance(p, pw)
+                      if math.Abs(varianceBefore-100.0/3) > 1e-10 { t.Fatalf("invalid control variance=%g", varianceBefore) }
+                      if math.IsInf(varianceAfter, 0) || math.IsNaN(varianceAfter) || math.Abs(varianceAfter-varianceBefore) > 1e-10 {
+                          t.Errorf("reused count weights: variance before=%g after=%g; want unchanged", varianceBefore, varianceAfter)
+                      }
+                  })
+              }
+          }
+
+          func TestWassersteinOverlappingWeightViews(t *testing.T) {
+              p, q := []float64{0, 10}, []float64{0, 20}
+              backing := []float64{1, 1, 1}
+              got := stat.WassersteinDistance(p, q, backing[:2], backing[1:])
+              if math.Abs(got-5) > 1e-10 { t.Errorf("overlapping weight views distance=%g, want 5", got) }
+              if !slices.Equal(backing, []float64{1, 1, 1}) { t.Errorf("backing=%v, want [1 1 1]", backing) }
+          }
+
+          func TestWassersteinUnchangedControls(t *testing.T) {
+              p, q := []float64{0, 10}, []float64{0, 20}
+              for _, tc := range []struct { name string; pw, qw []float64; want float64 }{
+                  {"nil uniform", nil, nil, 5},
+                  {"already normalized", []float64{0.5,0.5}, []float64{0.5,0.5}, 5},
+                  {"independent count weights", []float64{1,1}, []float64{1,1}, 5},
+                  {"nonuniform weights", []float64{3,1}, []float64{2,2}, 7.5},
+              } {
+                  t.Run(tc.name, func(t *testing.T) {
+                      got := stat.WassersteinDistance(p,q,tc.pw,tc.qw)
+                      if math.Abs(got-tc.want) > 1e-10 { t.Errorf("distance=%g, want %g",got,tc.want) }
+                  })
+              }
+              if got := stat.WassersteinDistance([]float64{1}, []float64{4}, []float64{2}, []float64{3}); got != 3 { t.Errorf("single points=%g, want 3",got) }
+              if got := stat.WassersteinDistance(p, p, []float64{2,2}, []float64{2,2}); got != 0 { t.Errorf("identical=%g, want 0",got) }
+          }
+          GONUM_FIXTURE
+          set +e
+          go test ./stat -run 'TestWasserstein(CountWeightsPreserved|OverlappingWeightViews|UnchangedControls)$' -count=1 -json > before.json
+          product_status=$?
+          set -e
+          cat before.json
+          test "$product_status" -eq 1
+          python3 - <<'GONUM_RESULT'
+          import json, pathlib, subprocess
+          events=[json.loads(line)for line in pathlib.Path('before.json').read_text().splitlines()]
+          failures={e['Test']for e in events if e.get('Test')and e['Action']=='fail'}
+          expected={'TestWassersteinCountWeightsPreserved','TestWassersteinCountWeightsPreserved/1D','TestWassersteinCountWeightsPreserved/ND','TestWassersteinOverlappingWeightViews'}
+          assert failures == expected, failures
+          assert any(e.get('Test')=='TestWassersteinUnchangedControls'and e['Action']=='pass'for e in events)
+          assert subprocess.check_output(['git','diff','--name-only'],text=True)==''
+          print('GONUM_PUBLIC_BEFORE='+json.dumps({'source':'bda3a37c92f9e957b722e54d48976dbac393bec4','go':subprocess.check_output(['go','version'],text=True).strip(),'failed_tests':sorted(failures),'controls_passed':True,'tracked_source_unchanged':True}))
+          GONUM_RESULT
